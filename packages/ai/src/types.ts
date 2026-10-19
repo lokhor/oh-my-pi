@@ -476,6 +476,18 @@ export type OpenAIResponseInclude =
 	| "reasoning.encrypted_content"
 	| "message.output_text.logprobs";
 
+/** Content-free timing metadata for an opt-in OpenAI-compatible HTTP request. */
+export interface OpenAIHttpPhaseEvent {
+	type: "omp_http_phase";
+	/** Local opaque ID; never sent to the provider or included in the request. */
+	request_id: string;
+	attempt: number;
+	phase: "request_dispatch" | "response_headers" | "first_body_byte" | "attempt_error" | "request_error";
+	elapsed_ms: number;
+	status_code?: number;
+	error_category?: "aborted" | "transport" | "http_status" | "empty_body";
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -643,6 +655,8 @@ export interface StreamOptions {
 	maxInFlightRequests?: Record<string, number>;
 	/** @internal Keep the in-flight permit until a provider's bounded terminal drain finishes. */
 	waitForTerminalDrain?: boolean;
+	/** @internal Content-free HTTP timings; diagnostic failures must not affect the request. */
+	onOpenAIHttpPhase?: (event: OpenAIHttpPhaseEvent) => void;
 	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.

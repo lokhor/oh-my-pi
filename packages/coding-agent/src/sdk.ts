@@ -639,6 +639,8 @@ export interface CreateAgentSessionOptions {
 	suppressAutoPrewalk?: boolean;
 	/** Force read-only plan mode at start, auto-approve on the model's first resolve call, then switch to execute. */
 	planYolo?: PlanYolo;
+	/** @internal Content-free OpenAI HTTP phase sink for explicitly opted-in JSON CLI runs. */
+	onOpenAIHttpPhase?: SimpleStreamOptions["onOpenAIHttpPhase"];
 
 	/** Provider-facing system prompt override. Replaces the fully rendered default blocks. */
 	systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
@@ -4499,6 +4501,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...streamOptions,
 					promptCacheKey: streamOptions?.promptCacheKey ?? session?.getPromptCacheKeyForModel(streamModel),
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
+					onOpenAIHttpPhase: streamOptions?.onOpenAIHttpPhase ?? options.onOpenAIHttpPhase,
 				};
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
