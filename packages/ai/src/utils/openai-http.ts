@@ -20,7 +20,7 @@ import { OpenAIHttpError } from "../error";
 
 export { OpenAIHttpError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, OpenAIHttpPhaseEvent } from "../types";
 import type { CapturedHttpErrorResponse } from "./http-inspector";
 
 /**
@@ -68,6 +68,8 @@ export interface OpenAIStreamRequestInit {
 	body: unknown;
 	signal: AbortSignal;
 	fetch?: FetchImpl;
+	/** @internal Content-free HTTP phase diagnostics; never receives request or response content. */
+	onHttpPhase?: (event: OpenAIHttpPhaseEvent) => void;
 	/** Override the default transport attempt budget for this request. */
 	maxAttempts?: number;
 	/** Optional caller-specific gate composed with shared transport retry exclusions. */
@@ -98,6 +100,9 @@ export interface OpenAIStreamHandle<TEvent> {
  * watchdog timers and abort-reason bookkeeping.
  */
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
+	const diagnostics = init.onHttpPhase
+		? createOpenAIHttpPhaseDiagnostics(init.onHttpPhase, init.signal, init.fetch ?? fetch)
+		: undefined;
 	let response: Response;
 	try {
 		response = await fetchWithRetry(init.url, {
@@ -105,7 +110,7 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 			headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
 			body: JSON.stringify(init.body),
 			signal: init.signal,
-			fetch: init.fetch,
+			fetch: diagnostics?.fetch ?? init.fetch,
 			maxAttempts: init.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
 			// A proxy concurrency-admission 429 (`rate_limit_type: max_parallel_requests`)
 			// surfaces immediately instead of being slept-and-retried here; session
@@ -119,23 +124,148 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 			timeout: false,
 		});
 	} catch (error) {
+		diagnostics?.cleanup();
+		diagnostics?.reportRequestError(classifyTransportError(error));
 		// Transport rejection after the retry budget: name the host and the cause
 		// instead of surfacing the runtime's bare `getaddrinfo …` text.
 		throw AIError.networkFailureError(error, init.url);
 	}
 	if (!response.ok) {
+		diagnostics?.cleanup();
+		diagnostics?.reportRequestError("http_status", response.status);
 		throw await captureOpenAIHttpError(response);
 	}
-	if (!response.body) {
+	const responseBody = response.body;
+	if (!responseBody) {
+		diagnostics?.cleanup();
+		diagnostics?.reportRequestError("empty_body", response.status);
 		throw new AIError.ProviderResponseError(`OpenAI stream response has no body (status ${response.status})`, {
 			kind: "envelope",
 		});
 	}
+	const body = diagnostics?.observeBody(responseBody) ?? responseBody;
 	return {
-		events: decodeStream<TEvent>(response.body, init.signal, init.onSseEvent, init.onDoneSentinel),
+		events: decodeStream<TEvent>(body, init.signal, init.onSseEvent, init.onDoneSentinel),
 		response,
 		requestId: response.headers.get("x-request-id"),
 	};
+}
+
+interface OpenAIHttpPhaseDiagnostics {
+	fetch: FetchImpl;
+	cleanup: () => void;
+	reportRequestError: (category: OpenAIHttpPhaseEvent["error_category"], statusCode?: number) => void;
+	observeBody: (body: ReadableStream<Uint8Array>) => ReadableStream<Uint8Array>;
+}
+
+function createOpenAIHttpPhaseDiagnostics(
+	onHttpPhase: (event: OpenAIHttpPhaseEvent) => void,
+	signal: AbortSignal,
+	baseFetch: FetchImpl,
+): OpenAIHttpPhaseDiagnostics {
+	const startedAt = performance.now();
+	const localRequestId = crypto.randomUUID();
+	let attempt = 0;
+	let requestErrorEmitted = false;
+	const emit = (
+		phase: OpenAIHttpPhaseEvent["phase"],
+		attemptNumber: number,
+		details: Pick<OpenAIHttpPhaseEvent, "status_code" | "error_category"> = {},
+	): void => {
+		try {
+			onHttpPhase({
+				type: "omp_http_phase",
+				request_id: localRequestId,
+				attempt: attemptNumber,
+				phase,
+				elapsed_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+				...details,
+			});
+		} catch {
+			// Diagnostics cannot alter provider request or stream behavior.
+		}
+	};
+	const reportRequestError = (category: OpenAIHttpPhaseEvent["error_category"], statusCode?: number): void => {
+		if (requestErrorEmitted) return;
+		requestErrorEmitted = true;
+		emit("request_error", attempt, {
+			error_category: category,
+			...(statusCode !== undefined ? { status_code: statusCode } : {}),
+		});
+	};
+	const onSignalAbort = (): void => reportRequestError("aborted");
+	const cleanup = (): void => signal.removeEventListener("abort", onSignalAbort);
+	signal.addEventListener("abort", onSignalAbort, { once: true });
+	if (signal.aborted) onSignalAbort();
+
+	return {
+		fetch: async (input, requestInit) => {
+			const currentAttempt = ++attempt;
+			emit("request_dispatch", currentAttempt);
+			try {
+				const response = await baseFetch(input, requestInit);
+				emit("response_headers", currentAttempt, { status_code: response.status });
+				return response;
+			} catch (error) {
+				emit("attempt_error", currentAttempt, { error_category: classifyTransportError(error) });
+				throw error;
+			}
+		},
+		cleanup,
+		reportRequestError,
+		observeBody: body =>
+			observeFirstBodyByte(
+				body,
+				() => emit("first_body_byte", attempt),
+				error => reportRequestError(classifyTransportError(error)),
+				cleanup,
+			),
+	};
+}
+function classifyTransportError(error: unknown): "aborted" | "transport" {
+	return error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted")
+		? "aborted"
+		: "transport";
+}
+
+function observeFirstBodyByte(
+	body: ReadableStream<Uint8Array>,
+	onFirstByte: () => void,
+	onReadError: (error: unknown) => void,
+	onDone: () => void,
+): ReadableStream<Uint8Array> {
+	const reader = body.getReader();
+	let observed = false;
+	return new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					onDone();
+					controller.close();
+					reader.releaseLock();
+					return;
+				}
+				if (!observed && value.byteLength > 0) {
+					observed = true;
+					onFirstByte();
+				}
+				controller.enqueue(value);
+			} catch (error) {
+				onReadError(error);
+				reader.releaseLock();
+				controller.error(error);
+			}
+		},
+		async cancel(reason) {
+			try {
+				await reader.cancel(reason);
+			} finally {
+				onDone();
+				reader.releaseLock();
+			}
+		},
+	});
 }
 
 /**

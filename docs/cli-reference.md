@@ -215,6 +215,11 @@ Related flags for headless runs:
 Incremental `message_update` events omit full partial-message snapshots; completed
 messages arrive in `message_end`, and opaque provider replay payloads are omitted.
 Terminal turn failures produce a nonzero exit status in both text and JSON modes.
+`OMP_HTTP_PHASE_DIAGNOSTICS=1` additionally writes content-free OpenAI HTTP
+phase events to stderr in JSON mode: local request ID, attempt, dispatch,
+response-header and first-body-byte timing, status, and coarse failure category.
+The ID is not sent to the provider; prompts, completions, headers and URLs are
+not included, so these events do not correlate requests at a remote router.
 
 `plan.defaultOnStartup` is ignored in print mode because there is no plan-review
 UI. Use `--plan-yolo` for unattended planning and implementation.

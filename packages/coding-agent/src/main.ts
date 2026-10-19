@@ -1368,6 +1368,11 @@ export async function buildSessionOptions(
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
 	};
+	if (parsed.mode === "json" && process.env.OMP_HTTP_PHASE_DIAGNOSTICS === "1") {
+		options.onOpenAIHttpPhase = event => {
+			process.stderr.write(`${JSON.stringify(event)}\n`);
+		};
+	}
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));
 	if (parsed.serviceTier !== undefined) {
 		options.openAIServiceTier = serviceTierSettingToTier(parsed.serviceTier) ?? null;
